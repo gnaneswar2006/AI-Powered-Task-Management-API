@@ -1,12 +1,13 @@
+"""Task management API backed by SQLite."""
 from datetime import datetime, timezone
 from enum import Enum
-from itertools import count
-from threading import Lock
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="AI-Powered Task Management API", version="0.1.0")
+from app import database
+
+app = FastAPI(title="AI-Powered Task Management API", version="0.2.0")
 
 
 class Priority(str, Enum):
@@ -33,13 +34,8 @@ class TaskUpdate(BaseModel):
     completed: bool | None = None
 
 
-tasks: dict[int, Task] = {}
-ids = count(1)
-lock = Lock()
-
-
 def recommend_priority(title: str, description: str) -> Priority:
-    """Simple explainable keyword baseline; not a trained AI model."""
+    """Explainable keyword baseline, not a trained AI model."""
     text = f"{title} {description}".lower()
     if any(word in text for word in ("urgent", "deadline", "critical", "asap")):
         return Priority.high
@@ -55,28 +51,20 @@ def health():
 
 @app.post("/tasks", response_model=Task, status_code=201)
 def create_task(payload: TaskCreate):
-    with lock:
-        task_id = next(ids)
-        task = Task(
-            **payload.model_dump(),
-            id=task_id,
-            priority=recommend_priority(payload.title, payload.description),
-            created_at=datetime.now(timezone.utc),
-        )
-        tasks[task_id] = task
-        return task
+    data = payload.model_dump()
+    data["priority"] = recommend_priority(payload.title, payload.description).value
+    data["created_at"] = datetime.now(timezone.utc).isoformat()
+    return database.insert_task(data)
 
 
 @app.get("/tasks", response_model=list[Task])
 def list_tasks():
-    with lock:
-        return list(tasks.values())
+    return database.list_tasks()
 
 
 @app.get("/tasks/{task_id}", response_model=Task)
 def get_task(task_id: int):
-    with lock:
-        task = tasks.get(task_id)
+    task = database.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
@@ -84,25 +72,19 @@ def get_task(task_id: int):
 
 @app.patch("/tasks/{task_id}", response_model=Task)
 def update_task(task_id: int, payload: TaskUpdate):
-    with lock:
-        task = tasks.get(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Task not found")
-        changes = payload.model_dump(exclude_unset=True)
-        if "title" in changes and changes["title"] is None:
-            raise HTTPException(status_code=422, detail="Title cannot be null")
-        if "description" in changes and changes["description"] is None:
-            raise HTTPException(status_code=422, detail="Description cannot be null")
-        if "completed" in changes and changes["completed"] is None:
-            raise HTTPException(status_code=422, detail="Completed cannot be null")
-        updated = task.model_copy(update=changes)
-        updated.priority = recommend_priority(updated.title, updated.description)
-        tasks[task_id] = updated
-        return updated
+    changes = payload.model_dump(exclude_unset=True)
+    if any(value is None for value in changes.values()):
+        raise HTTPException(status_code=422, detail="Task fields cannot be null")
+    current = database.get_task(task_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    title = changes.get("title", current["title"])
+    description = changes.get("description", current["description"])
+    changes["priority"] = recommend_priority(title, description).value
+    return database.update_task(task_id, changes)
 
 
 @app.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int):
-    with lock:
-        if tasks.pop(task_id, None) is None:
-            raise HTTPException(status_code=404, detail="Task not found")
+    if not database.delete_task(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
